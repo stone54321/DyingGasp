@@ -89,7 +89,9 @@ The first 4 KB (`0x0000..0x0FFF`) contains immutable metadata, geometric constan
 ### 2.2 Record Format (64 Bytes, Little-Endian)
 Records are persisted in 64-byte slots starting at byte offset `0x00001000` (4096).
 Physical file offset formula:
-$$\text{Offset} = 4096 + (\text{seq} \pmod{\text{record\_count}}) \times 64$$
+```c
+Offset = 4096 + (seq % record_count) * 64;
+```
 
 #### Type 0: Periodic Telemetry Record
 Persisted on each timer interval (10 Hz nominal).
@@ -261,10 +263,10 @@ The analyzer runs automated anomaly detection rules across chronological samples
 
 | Anomaly Tag | Detection Criterion | Hardware / Diagnostic Meaning |
 |---|---|---|
-| `[HANG]` | $\Delta t_{\text{sample}} > 3 \times \text{nominal period}$ | Kernel freeze, high-priority DPC/ISR storm, or scheduler starvation. |
-| `[POWER SPIKE]` | $|\Delta P_{\text{GPU}}| > 100\text{ W}$ ($100,000\text{ mW}$) | Transient voltage surge, VRM collapse, or PSU trip (OCP/UVP). |
+| `[HANG]` | Delta-t > 3x nominal period | Kernel freeze, high-priority DPC/ISR storm, or scheduler starvation. |
+| `[POWER SPIKE]` | \|Delta-P_GPU\| > 100 W (100,000 mW) | Transient voltage surge, VRM collapse, or PSU trip (OCP/UVP). |
 | `[PCIE DROP]` | Link Gen or Width decreased | Physical PCIe bus degradation, damaged traces, or riser cable failure. |
-| `[REPLAY JUMP]` | PCIe replay counter increased ($\Delta > 0$) | Physical layer PCIe link packet transmission errors requiring replay. |
+| `[REPLAY JUMP]` | PCIe replay counter increased (Delta > 0) | Physical layer PCIe link packet transmission errors requiring replay. |
 | `[TORN RECORD]` | Corrupted magic/type/seq at boundary | Abrupt power interruption mid-record; boundary discarded safely. |
 
 ---

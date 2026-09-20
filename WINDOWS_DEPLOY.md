@@ -109,7 +109,7 @@ Displays total ring capacity, total valid records recovered, buffer wrap counts,
 ### 2. Automated Anomaly Detection
 The anomaly engine flags critical system failures:
 - `[HANG]`: Polling interval between records exceeds `3x` the nominal period (e.g. tick took >300 ms at 10 Hz), indicating kernel starvation, DPC/ISR storms, or hardware lockup.
-- `[POWER SPIKE]`: GPU board power fluctuated by $>100\text{ W}$ ($100,000\text{ mW}$) between consecutive samples, indicative of transient power rail collapse or PSU over-current trip (OCP).
+- `[POWER SPIKE]`: GPU board power fluctuated by >100 W (100,000 mW) between consecutive samples, indicative of transient power rail collapse or PSU over-current trip (OCP).
 - `[PCIE DROP]`: PCIe link generation or link width degraded relative to the previous sample (e.g. Gen4 x16 degraded to Gen1 x4), indicating PCIe bus instability, slot debris, or riser cable failure.
 - `[REPLAY JUMP]`: Hardware PCIe replay counter incremented, confirming physical layer transmission retries across the PCIe bus.
 - `[TORN RECORD]`: A record partially committed during power-off is detected at the boundary and discarded without memory fault.
