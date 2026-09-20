@@ -1,0 +1,25 @@
+# Build directories & intermediate objects
+build/
+build-*/
+cmake-build-*/
+*.obj
+*.o
+*.lib
+*.a
+
+# Test & runtime ring files
+*.bin
+!tests/fixtures/*.bin
+*.log
+*.tmp
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# IDEs & OS artifacts
+.vscode/
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
