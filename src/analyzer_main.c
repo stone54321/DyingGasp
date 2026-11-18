@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <windows.h>
+#include <shellapi.h>
+#include <limits.h>
+#include "cli.h"
 
 #include "blackbox_format.h"
 #include "blackbox_common.h"
@@ -97,45 +100,34 @@ static void print_usage(const char *prog_name) {
     printf("  -h, --help                Display this help message and exit\n");
 }
 
-static bool parse_cli_args(int argc, char *argv[], cli_options_t *opts) {
+static bool parse_cli_args(int argc, wchar_t *argv[], cli_options_t *opts) {
     memset(opts, 0, sizeof(*opts));
     opts->gap_index = -1;
-
     for (int i = 1; i < argc; ++i) {
-        const char *arg = argv[i];
-        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+        const wchar_t *arg = argv[i];
+        const wchar_t *path = NULL;
+        const wchar_t *gap = NULL;
+        if (wcscmp(arg, L"-h") == 0 || wcscmp(arg, L"--help") == 0) {
             opts->show_help = true;
             return true;
-        } else if (strcmp(arg, "--no-eventlog") == 0) {
-            opts->no_eventlog = true;
-        } else if (strncmp(arg, "--gap=", 6) == 0) {
-            opts->gap_index = atoi(arg + 6);
-        } else if (strcmp(arg, "--gap") == 0) {
-            if (i + 1 < argc) {
-                opts->gap_index = atoi(argv[++i]);
-            } else {
-                fprintf(stderr, "Error: --gap requires an integer argument.\n");
-                return false;
-            }
-        } else if (strncmp(arg, "--ring=", 7) == 0) {
-            MultiByteToWideChar(CP_UTF8, 0, arg + 7, -1, opts->ring_path, MAX_PATH);
-        } else if (strcmp(arg, "--ring") == 0) {
-            if (i + 1 < argc) {
-                MultiByteToWideChar(CP_UTF8, 0, argv[++i], -1, opts->ring_path, MAX_PATH);
-            } else {
-                fprintf(stderr, "Error: --ring requires a path argument.\n");
-                return false;
-            }
-        } else if (strncmp(arg, "--ring-path=", 12) == 0) {
-            MultiByteToWideChar(CP_UTF8, 0, arg + 12, -1, opts->ring_path, MAX_PATH);
-        } else if (strncmp(arg, "--path=", 7) == 0) {
-            MultiByteToWideChar(CP_UTF8, 0, arg + 7, -1, opts->ring_path, MAX_PATH);
-        } else if (arg[0] != '-') {
-            if (opts->ring_path[0] == L'\0') {
-                MultiByteToWideChar(CP_UTF8, 0, arg, -1, opts->ring_path, MAX_PATH);
-            }
-        } else {
-            fprintf(stderr, "Warning: Unrecognized option '%s'\n", arg);
+        } else if (wcscmp(arg, L"--no-eventlog") == 0) opts->no_eventlog = true;
+        else if (wcsncmp(arg, L"--gap=", 6) == 0) gap = arg + 6;
+        else if (wcscmp(arg, L"--gap") == 0) {
+            if (++i >= argc) return false;
+            gap = argv[i];
+        } else if (wcsncmp(arg, L"--ring=", 7) == 0) path = arg + 7;
+        else if (wcscmp(arg, L"--ring") == 0) {
+            if (++i >= argc) return false;
+            path = argv[i];
+        } else if (wcsncmp(arg, L"--ring-path=", 12) == 0) path = arg + 12;
+        else if (wcsncmp(arg, L"--path=", 7) == 0) path = arg + 7;
+        else if (arg[0] != L'-') path = arg;
+        else return false;
+        if (path && (opts->ring_path[0] || !cli_path(opts->ring_path, MAX_PATH, path))) return false;
+        if (gap) {
+            uint64_t value;
+            if (!cli_uint(gap, 1, INT_MAX, &value)) return false;
+            opts->gap_index = (int)value;
         }
     }
     return true;
@@ -360,8 +352,14 @@ static void query_live_nvml_replay(uint32_t last_recorded_replay) {
 }
 
 int main(int argc, char *argv[]) {
-    cli_options_t opts;
-    if (!parse_cli_args(argc, argv, &opts)) {
+    cli_options_t opts = {0};
+    BLACKBOX_UNUSED(argc);
+    int argc_w = 0;
+    wchar_t **argv_w = CommandLineToArgvW(GetCommandLineW(), &argc_w);
+    bool args_ok = argv_w && parse_cli_args(argc_w, argv_w, &opts);
+    if (argv_w) LocalFree(argv_w);
+    if (!args_ok) {
+        fprintf(stderr, "Error: Invalid arguments or path. Use --help.\n");
         return 1;
     }
 
@@ -422,7 +420,9 @@ int main(int argc, char *argv[]) {
     if (hdr.magic != BLACKBOX_MAGIC ||
         hdr.version != BLACKBOX_VERSION ||
         hdr.header_size != BLACKBOX_HEADER_SIZE ||
-        hdr.record_size != BLACKBOX_RECORD_SIZE) {
+        hdr.record_size != BLACKBOX_RECORD_SIZE ||
+        hdr.ring_bytes != BLACKBOX_HEADER_SIZE + (uint64_t)hdr.record_count * BLACKBOX_RECORD_SIZE ||
+        file_size > hdr.ring_bytes) {
         fprintf(stderr, "Error: Invalid blackbox ring buffer header (magic/version/geometry mismatch).\n");
         CloseHandle(hFile);
         return 1;
@@ -435,9 +435,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Only allocate for complete physical slots; an untrusted header must not
+     * cause a multi-gigabyte allocation for a tiny truncated file. */
+    uint32_t available_slots = (uint32_t)((file_size - BLACKBOX_HEADER_SIZE) / BLACKBOX_RECORD_SIZE);
+    size_t allocation_count = available_slots ? available_slots : 1;
     /* Allocate slot storage and pointer array */
-    blackbox_record_t *all_records = (blackbox_record_t *)calloc(record_count, sizeof(blackbox_record_t));
-    const blackbox_record_t **valid_records = (const blackbox_record_t **)calloc(record_count, sizeof(blackbox_record_t *));
+    blackbox_record_t *all_records = (blackbox_record_t *)calloc(allocation_count, sizeof(blackbox_record_t));
+    const blackbox_record_t **valid_records = (const blackbox_record_t **)calloc(allocation_count, sizeof(blackbox_record_t *));
     if (!all_records || !valid_records) {
         fprintf(stderr, "Error: Failed to allocate memory for %u record slots.\n", record_count);
         if (all_records) free(all_records);
@@ -449,11 +453,11 @@ int main(int argc, char *argv[]) {
     pid_map_t pid_map;
     pid_map_init(&pid_map);
 
-    bool has_torn = false;
+    bool has_torn = file_size < hdr.ring_bytes;
     size_t valid_count = 0;
 
     /* Scan each physical slot */
-    for (uint32_t slot = 0; slot < record_count; ++slot) {
+    for (uint32_t slot = 0; slot < available_slots; ++slot) {
         uint64_t offset = (uint64_t)BLACKBOX_HEADER_SIZE + ((uint64_t)slot * (uint64_t)BLACKBOX_RECORD_SIZE);
         if (offset + sizeof(blackbox_record_t) > file_size) {
             has_torn = true;
@@ -526,26 +530,48 @@ int main(int argc, char *argv[]) {
     char last_time_str[32] = "N/A";
     uint64_t min_seq = 0;
     uint64_t max_seq = 0;
-    double actual_hz = (double)hdr.nominal_hz;
+    double actual_hz = 0.0;
+    uint64_t *record_times = (uint64_t *)calloc(valid_count ? valid_count : 1, sizeof(uint64_t));
+    if (!record_times) {
+        pid_map_free(&pid_map);
+        free(all_records);
+        free(valid_records);
+        fprintf(stderr, "Error: Failed to allocate timeline.\n");
+        return 1;
+    }
+    blackbox_header_t anchor = hdr;
+    for (size_t i = 0; i < valid_count; ++i) {
+        const blackbox_record_t *rec = valid_records[i];
+        if (rec->common.type == BLACKBOX_RECORD_TYPE_CALIBRATION) {
+            anchor.qpc_start_100ns = rec->cal.qpc_100ns;
+            anchor.filetime_start = rec->cal.filetime;
+        }
+        record_times[i] = calibration_qpc_to_filetime(&anchor, blackbox_record_get_qpc_100ns(rec));
+    }
 
     if (valid_count > 0) {
         min_seq = blackbox_record_get_seq(valid_records[0]);
         max_seq = blackbox_record_get_seq(valid_records[valid_count - 1]);
         wrap_count = (uint32_t)(max_seq / (uint64_t)record_count);
 
-        uint64_t first_qpc = blackbox_record_get_qpc_100ns(valid_records[0]);
-        uint64_t last_qpc = blackbox_record_get_qpc_100ns(valid_records[valid_count - 1]);
-        uint64_t first_ft = calibration_qpc_to_filetime(&hdr, first_qpc);
-        uint64_t last_ft = calibration_qpc_to_filetime(&hdr, last_qpc);
+        uint64_t first_ft = record_times[0];
+        uint64_t last_ft = record_times[valid_count - 1];
         calibration_format_filetime_utc(first_ft, first_time_str, sizeof(first_time_str));
         calibration_format_filetime_utc(last_ft, last_time_str, sizeof(last_time_str));
 
-        if (last_qpc > first_qpc && valid_count > 1) {
-            double dt_sec = (double)(last_qpc - first_qpc) / 10000000.0;
-            if (dt_sec > 0.0) {
-                actual_hz = (double)valid_count / dt_sec;
-            }
+        size_t data_count = 0;
+        uint64_t first_data_qpc = 0, last_data_qpc = 0;
+        for (size_t i = 0; i < valid_count; ++i) {
+            if (valid_records[i]->common.type != BLACKBOX_RECORD_TYPE_DATA) continue;
+            uint64_t qpc = valid_records[i]->data.qpc_100ns;
+            if (data_count && qpc < last_data_qpc) data_count = 0;
+            if (data_count == 0) first_data_qpc = qpc;
+            last_data_qpc = qpc;
+            ++data_count;
         }
+        actual_hz = 0.0;
+        if (data_count > 1 && last_data_qpc > first_data_qpc)
+            actual_hz = (double)(data_count - 1) * 10000000.0 / (double)(last_data_qpc - first_data_qpc);
     }
 
     /* Print Summary Line & Ring Health Summary */
@@ -626,11 +652,18 @@ int main(int argc, char *argv[]) {
         printf("| SEQ   | WALL CLOCK (UTC)        | GPU PWR | TEMP   | PCIE     | REPLAY | SM CLK  | MEM CLK | CPU%% | FG PROCESS (PID)     |\n");
         printf("+-------+-------------------------+---------+--------+----------+--------+---------+---------+------+----------------------+\n");
 
+        /* Reconstruct process names in sequence order, never from future slots. */
+        pid_map_free(&pid_map);
+        pid_map_init(&pid_map);
+        for (size_t idx = 0; idx < start_idx; ++idx) {
+            const blackbox_record_t *rec = valid_records[idx];
+            if (rec->common.type == BLACKBOX_RECORD_TYPE_PROCESS)
+                pid_map_put(&pid_map, rec->process.fg_pid, rec->process.name);
+        }
         for (size_t idx = start_idx; idx <= end_idx; ++idx) {
             const blackbox_record_t *rec = valid_records[idx];
             uint64_t seq = blackbox_record_get_seq(rec);
-            uint64_t qpc = blackbox_record_get_qpc_100ns(rec);
-            uint64_t ft = calibration_qpc_to_filetime(&hdr, qpc);
+            uint64_t ft = record_times[idx];
             char time_str[32];
             calibration_format_filetime_utc(ft, time_str, sizeof(time_str));
 
@@ -704,6 +737,7 @@ int main(int argc, char *argv[]) {
                        cpu_str,
                        fg_proc_str);
             } else if (rec->common.type == BLACKBOX_RECORD_TYPE_PROCESS) {
+                pid_map_put(&pid_map, rec->process.fg_pid, rec->process.name);
                 char pname[33];
                 memcpy(pname, rec->process.name, 32);
                 pname[32] = '\0';
@@ -736,7 +770,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (is_clean_tail) {
-        printf("\nNO GAP DETECTED (clean tail)\n\n");
+        if (blackbox_header_get_clean_shutdown(&hdr) == 1 && !has_torn)
+            printf("\nNO GAP DETECTED (clean tail)\n\n");
+        else
+            printf("\nNO GAP DETECTED (unclean or active session; crash cutoff is possible)\n\n");
     } else {
         printf("\nPre-gap telemetry window displayed (%zu records).\n\n", (end_idx >= start_idx) ? (end_idx - start_idx + 1) : 0);
     }
@@ -774,6 +811,7 @@ int main(int argc, char *argv[]) {
     pid_map_free(&pid_map);
     free(all_records);
     free(valid_records);
+    free(record_times);
 
     return 0;
 }

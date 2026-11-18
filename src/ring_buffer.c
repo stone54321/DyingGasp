@@ -34,7 +34,9 @@ bool ring_buffer_writer_init_w(ring_buffer_writer_t *writer,
                                const wchar_t *file_path,
                                uint64_t ring_bytes,
                                const blackbox_header_t *initial_header) {
-    if (!writer || !file_path || ring_bytes < (BLACKBOX_HEADER_SIZE + BLACKBOX_RECORD_SIZE)) {
+    if (!writer || !file_path || ring_bytes < (BLACKBOX_HEADER_SIZE + BLACKBOX_RECORD_SIZE) ||
+        (ring_bytes - BLACKBOX_HEADER_SIZE) % BLACKBOX_RECORD_SIZE != 0 ||
+        (ring_bytes - BLACKBOX_HEADER_SIZE) / BLACKBOX_RECORD_SIZE > UINT32_MAX) {
         return false;
     }
 
@@ -46,7 +48,7 @@ bool ring_buffer_writer_init_w(ring_buffer_writer_t *writer,
 
     ensure_parent_directory_w(file_path);
 
-    /* Open file with write-through flag: unbuffered synchronous persistence */
+    /* Synchronous write-through I/O; filesystem/device caches still apply. */
     HANDLE h_file = CreateFileW(
         file_path,
         GENERIC_READ | GENERIC_WRITE,
@@ -247,13 +249,17 @@ bool ring_buffer_reader_open_w(ring_buffer_reader_t *reader, const wchar_t *file
     if (reader->header.magic != BLACKBOX_MAGIC ||
         reader->header.version != BLACKBOX_VERSION ||
         reader->header.header_size != BLACKBOX_HEADER_SIZE ||
-        reader->header.record_size != BLACKBOX_RECORD_SIZE) {
+        reader->header.record_size != BLACKBOX_RECORD_SIZE ||
+        reader->header.record_count == 0 ||
+        reader->header.ring_bytes != BLACKBOX_HEADER_SIZE +
+            (uint64_t)reader->header.record_count * BLACKBOX_RECORD_SIZE ||
+        reader->file_size > reader->header.ring_bytes) {
         CloseHandle(h_file);
         return false;
     }
 
     reader->h_file = h_file;
-    reader->record_count = (uint32_t)((reader->file_size - BLACKBOX_HEADER_SIZE) / BLACKBOX_RECORD_SIZE);
+    reader->record_count = reader->header.record_count;
     reader->is_valid_header = true;
 
     return true;
@@ -297,9 +303,8 @@ bool ring_buffer_reader_read_slot(const ring_buffer_reader_t *reader,
 
 bool ring_buffer_is_record_empty(const blackbox_record_t *record) {
     if (!record) return true;
-    const uint64_t *p64 = (const uint64_t *)record->raw;
-    for (size_t i = 0; i < sizeof(blackbox_record_t) / sizeof(uint64_t); ++i) {
-        if (p64[i] != 0) return false;
+    for (size_t i = 0; i < sizeof(record->raw); ++i) {
+        if (record->raw[i] != 0) return false;
     }
     return true;
 }
@@ -341,7 +346,8 @@ bool ring_buffer_scan_bounds(const ring_buffer_reader_t *reader,
     bool found_any = false;
 
     blackbox_record_t rec;
-    for (uint32_t slot = 0; slot < reader->record_count; ++slot) {
+    uint32_t available = (uint32_t)((reader->file_size - BLACKBOX_HEADER_SIZE) / BLACKBOX_RECORD_SIZE);
+    for (uint32_t slot = 0; slot < available; ++slot) {
         if (!ring_buffer_reader_read_slot(reader, slot, &rec)) {
             continue;
         }

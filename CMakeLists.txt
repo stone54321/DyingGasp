@@ -37,7 +37,7 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
     # Warning level 4, optimization /O2, security checks /GS, string pooling /GF
-    add_compile_options(/W4 /O2 /GS /GF /Gy)
+    add_compile_options(/W4 /utf-8 /GS /GF /Gy)
     if(ENABLE_STRICT_WARNINGS)
         add_compile_options(/WX)
     endif()
@@ -97,7 +97,7 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/collector_main.c" OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/collector/main.c")
     add_executable(blackbox ${COLLECTOR_SOURCES})
-    target_link_libraries(blackbox PRIVATE kernel32 user32 advapi32)
+    target_link_libraries(blackbox PRIVATE kernel32 user32 advapi32 shell32)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -136,19 +136,31 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/analyzer_main.c" OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/analyzer/main.c")
     add_executable(blackbox-analyze ${ANALYZER_SOURCES})
-    target_link_libraries(blackbox-analyze PRIVATE kernel32 user32 advapi32 wevtapi)
+    target_link_libraries(blackbox-analyze PRIVATE kernel32 user32 advapi32 shell32 wevtapi)
 endif()
 
 # -----------------------------------------------------------------------------
 # Tests & Generators
 # -----------------------------------------------------------------------------
 if(BUILD_TESTS)
+    enable_testing()
+    add_executable(blackbox-test-core tests/test_core.c
+        src/ring_buffer.c src/calibration.c src/timer_loop.c
+        src/telemetry_nvml.c src/telemetry_process.c)
+    target_link_libraries(blackbox-test-core PRIVATE kernel32 user32 advapi32)
+    add_test(NAME core COMMAND blackbox-test-core)
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_FOUND AND NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME regressions COMMAND ${CMAKE_COMMAND} -E env
+            "BLACKBOX_TEST_BIN=$<TARGET_FILE_DIR:blackbox>"
+            ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_regressions.py -v)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_gen.c")
         add_executable(synthetic_gen
             tests/synthetic_gen.c
             src/ring_buffer.c
             src/calibration.c
         )
-        target_link_libraries(synthetic_gen PRIVATE kernel32 user32 advapi32)
+        target_link_libraries(synthetic_gen PRIVATE kernel32 user32 advapi32 shell32)
     endif()
 endif()

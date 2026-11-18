@@ -23,3 +23,9 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local validation outputs
+bin/blackbox-test-core.exe
+*.pdb
+*.ilk
+tests/*report.json

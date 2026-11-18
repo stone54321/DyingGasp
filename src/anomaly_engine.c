@@ -94,6 +94,10 @@ void anomaly_engine_scan(const blackbox_record_t * const *records,
     uint32_t nominal_hz = (hdr->nominal_hz > 0) ? hdr->nominal_hz : 10;
     uint64_t nominal_100ns = 10000000ULL / (uint64_t)nominal_hz;
 
+    const blackbox_record_t *previous_data =
+        records[0]->common.type == BLACKBOX_RECORD_TYPE_DATA ? records[0] : NULL;
+
+    blackbox_header_t anchor = *hdr;
     for (size_t i = 1; i < count; ++i) {
         const blackbox_record_t *prev = records[i - 1];
         const blackbox_record_t *curr = records[i];
@@ -103,12 +107,17 @@ void anomaly_engine_scan(const blackbox_record_t * const *records,
         uint64_t qpc_prev = blackbox_record_get_qpc_100ns(prev);
         uint64_t qpc_curr = blackbox_record_get_qpc_100ns(curr);
 
+        if (prev->common.type == BLACKBOX_RECORD_TYPE_CALIBRATION) {
+            anchor.qpc_start_100ns = prev->cal.qpc_100ns;
+            anchor.filetime_start = prev->cal.filetime;
+        }
+
         /* 1. Gap Check (discontinuity in monotonic sequence) */
-        if (seq_curr > seq_prev + 1) {
+        if (seq_curr > seq_prev && seq_curr - seq_prev > 1) {
             uint64_t lost = seq_curr - seq_prev - 1;
             uint64_t dt_100ns = (qpc_curr >= qpc_prev) ? (qpc_curr - qpc_prev) : 0;
             double dur_sec = (double)dt_100ns / 10000000.0;
-            uint64_t start_ft = calibration_qpc_to_filetime(hdr, qpc_prev);
+            uint64_t start_ft = calibration_qpc_to_filetime(&anchor, qpc_prev);
 
             gap_entry_t gap;
             memset(&gap, 0, sizeof(gap));
@@ -126,9 +135,11 @@ void anomaly_engine_scan(const blackbox_record_t * const *records,
             }
         }
 
-        /* 2. Anomaly: HANG (> 3x nominal polling period) */
-        if (qpc_curr > qpc_prev) {
-            uint64_t dt_100ns = qpc_curr - qpc_prev;
+        /* Compare polling intervals across intervening service records. */
+        if (qpc_curr < qpc_prev) previous_data = NULL;
+        if (curr->common.type == BLACKBOX_RECORD_TYPE_DATA && previous_data &&
+            qpc_curr > previous_data->data.qpc_100ns) {
+            uint64_t dt_100ns = qpc_curr - previous_data->data.qpc_100ns;
             if (dt_100ns > 3 * nominal_100ns) {
                 double dt_ms = (double)dt_100ns / 10000.0;
                 double nom_ms = (double)nominal_100ns / 10000.0;
@@ -142,12 +153,15 @@ void anomaly_engine_scan(const blackbox_record_t * const *records,
             }
         }
 
-        /* Telemetry comparison for adjacent Type 0 Data records */
-        if (prev->common.type == BLACKBOX_RECORD_TYPE_DATA &&
-            curr->common.type == BLACKBOX_RECORD_TYPE_DATA) {
+        /* Service records must not hide changes between telemetry samples.
+         * A QPC reset marks a new boot/session, so do not compare across it. */
+        if (curr->common.type != BLACKBOX_RECORD_TYPE_DATA) continue;
+        const blackbox_record_t *data_prev = previous_data;
+        previous_data = curr;
+        if (data_prev) {
 
             /* 3. Anomaly: POWER SPIKE (> 100 W = 100,000 mW delta) */
-            uint32_t p0 = prev->data.gpu_power_mw;
+            uint32_t p0 = data_prev->data.gpu_power_mw;
             uint32_t p1 = curr->data.gpu_power_mw;
             if (p0 != BLACKBOX_SENTINEL_U32 && p1 != BLACKBOX_SENTINEL_U32) {
                 long long delta = (long long)p1 - (long long)p0;
@@ -165,26 +179,25 @@ void anomaly_engine_scan(const blackbox_record_t * const *records,
             }
 
             /* 4. Anomaly: PCIE DROP (gen or width decreased) */
-            uint8_t g0 = prev->data.pcie_gen;
-            uint8_t w0 = prev->data.pcie_width;
+            uint8_t g0 = data_prev->data.pcie_gen;
+            uint8_t w0 = data_prev->data.pcie_width;
             uint8_t g1 = curr->data.pcie_gen;
             uint8_t w1 = curr->data.pcie_width;
-            if (g0 != BLACKBOX_SENTINEL_U8 && g1 != BLACKBOX_SENTINEL_U8 &&
-                w0 != BLACKBOX_SENTINEL_U8 && w1 != BLACKBOX_SENTINEL_U8) {
-                if (g1 < g0 || w1 < w0) {
-                    char details[256];
-                    snprintf(details, sizeof(details),
-                             "PCIe link degraded from Gen%u x%u to Gen%u x%u",
-                             (unsigned int)g0, (unsigned int)w0,
-                             (unsigned int)g1, (unsigned int)w1);
-                    if (out_report) {
-                        anomaly_report_add(out_report, ANOMALY_PCIE_DROP, seq_curr, "PCIE DROP", details);
-                    }
+            bool gen_drop = g0 != BLACKBOX_SENTINEL_U8 && g1 != BLACKBOX_SENTINEL_U8 && g1 < g0;
+            bool width_drop = w0 != BLACKBOX_SENTINEL_U8 && w1 != BLACKBOX_SENTINEL_U8 && w1 < w0;
+            if (gen_drop || width_drop) {
+                char details[256];
+                snprintf(details, sizeof(details),
+                         "PCIe link decreased from Gen%u x%u to Gen%u x%u (255 = unavailable)",
+                         (unsigned int)g0, (unsigned int)w0,
+                         (unsigned int)g1, (unsigned int)w1);
+                if (out_report) {
+                    anomaly_report_add(out_report, ANOMALY_PCIE_DROP, seq_curr, "PCIE DROP", details);
                 }
             }
 
             /* 5. Anomaly: REPLAY JUMP (counter increased) */
-            uint32_t r0 = prev->data.pcie_replay;
+            uint32_t r0 = data_prev->data.pcie_replay;
             uint32_t r1 = curr->data.pcie_replay;
             if (r0 != BLACKBOX_SENTINEL_U32 && r1 != BLACKBOX_SENTINEL_U32 && r1 > r0) {
                 unsigned int delta = (unsigned int)(r1 - r0);

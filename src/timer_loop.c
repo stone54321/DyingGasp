@@ -55,9 +55,9 @@ bool timer_loop_init(timer_loop_t *loop,
     return true;
 }
 
-void timer_loop_run(timer_loop_t *loop) {
+bool timer_loop_run(timer_loop_t *loop) {
     if (!loop || !loop->writer || !loop->writer->is_initialized || !loop->h_timer) {
-        return;
+        return false;
     }
 
     /* -------------------------------------------------------------------------
@@ -110,7 +110,7 @@ void timer_loop_run(timer_loop_t *loop) {
         resume_cal.cal.tsc       = start_tsc;
         resume_cal.cal.qpc_100ns = start_qpc_100ns;
         resume_cal.cal.filetime  = start_ft;
-        ring_buffer_writer_write_record(loop->writer, &resume_cal);
+        if (!ring_buffer_writer_write_record(loop->writer, &resume_cal)) return false;
     } else {
         /*
          * Fresh ring session:
@@ -133,7 +133,7 @@ void timer_loop_run(timer_loop_t *loop) {
         initial_data.data.seq           = loop->seq++;
         initial_data.data.tsc           = start_tsc;
         initial_data.data.qpc_100ns     = start_qpc_100ns;
-        ring_buffer_writer_write_record(loop->writer, &initial_data);
+        if (!ring_buffer_writer_write_record(loop->writer, &initial_data)) return false;
 
         /*
          * Record 1 (seq 1): Type 2 Calibration Service Record.
@@ -146,37 +146,36 @@ void timer_loop_run(timer_loop_t *loop) {
         startup_cal.cal.tsc       = start_tsc;
         startup_cal.cal.qpc_100ns = start_qpc_100ns;
         startup_cal.cal.filetime  = start_ft;
-        ring_buffer_writer_write_record(loop->writer, &startup_cal);
+        if (!ring_buffer_writer_write_record(loop->writer, &startup_cal)) return false;
 
-        /*
-         * Record 2 (seq 2): Type 1 Process Transition Record.
-         * Emitted at startup if an active foreground process exists to seed pid -> name mapping.
-         */
-        if (cur_fg_pid != 0) {
-            blackbox_record_t startup_proc;
-            memset(&startup_proc, 0, sizeof(startup_proc));
-            startup_proc.process.type      = BLACKBOX_RECORD_TYPE_PROCESS;
-            startup_proc.process.flags     = (uint8_t)flags;
-            startup_proc.process.name_len  = cur_fg_name_len;
-            startup_proc.process.pad0      = 0;
-            startup_proc.process.seq       = loop->seq++;
-            startup_proc.process.tsc       = start_tsc;
-            startup_proc.process.qpc_100ns = start_qpc_100ns;
-            startup_proc.process.fg_pid    = (uint32_t)cur_fg_pid;
-            memcpy(startup_proc.process.name, cur_fg_name, 32);
-            ring_buffer_writer_write_record(loop->writer, &startup_proc);
-        }
+    }
+    /*
+     * Type 1 Process Transition Record (fresh and resumed sessions).
+     * Emitted at startup if an active foreground process exists to seed pid -> name mapping.
+     */
+    if (cur_fg_pid != 0) {
+        blackbox_record_t startup_proc;
+        memset(&startup_proc, 0, sizeof(startup_proc));
+        startup_proc.process.type      = BLACKBOX_RECORD_TYPE_PROCESS;
+        startup_proc.process.flags     = (uint8_t)flags;
+        startup_proc.process.name_len  = cur_fg_name_len;
+        startup_proc.process.pad0      = 0;
+        startup_proc.process.seq       = loop->seq++;
+        startup_proc.process.tsc       = start_tsc;
+        startup_proc.process.qpc_100ns = start_qpc_100ns;
+        startup_proc.process.fg_pid    = (uint32_t)cur_fg_pid;
+        memcpy(startup_proc.process.name, cur_fg_name, 32);
+        if (!ring_buffer_writer_write_record(loop->writer, &startup_proc)) return false;
     }
 
     /* -------------------------------------------------------------------------
      * Arm Periodic Waitable Timer
      * ------------------------------------------------------------------------- */
     LARGE_INTEGER due_time;
-    due_time.QuadPart = -10000LL; /* Relative delay of 1 ms to start first tick */
-    LONG period_ms = (LONG)(1000 / loop->config.hz);
-    if (period_ms < 1) period_ms = 1;
-
-    SetWaitableTimer(loop->h_timer, &due_time, period_ms, NULL, NULL, FALSE);
+    due_time.QuadPart = -(LONGLONG)loop->nominal_interval_100ns;
+    uint64_t next_tick = start_qpc_100ns + loop->nominal_interval_100ns;
+    /* One-shot deadlines avoid rounding e.g. 60 Hz down to a 16 ms period. */
+    if (!SetWaitableTimer(loop->h_timer, &due_time, 0, NULL, NULL, FALSE)) return false;
 
     HANDLE wait_handles[2];
     wait_handles[0] = loop->config.h_stop_event;
@@ -202,12 +201,12 @@ void timer_loop_run(timer_loop_t *loop) {
         DWORD timer_index = (num_handles == 2) ? (WAIT_OBJECT_0 + 1) : WAIT_OBJECT_0;
         if (wait_res != timer_index) {
             /* Unexpected error or abandoned wait */
-            break;
+            return false;
         }
 
         /* 1. Time & Lateness Sampling */
         LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
+        if (!QueryPerformanceCounter(&qpc_now)) return false;
         uint64_t current_qpc_100ns = calibration_qpc_ticks_to_100ns((uint64_t)qpc_now.QuadPart,
                                                                     loop->calibration->qpc_freq);
         uint64_t current_tsc = blackbox_rdtsc();
@@ -248,6 +247,7 @@ void timer_loop_run(timer_loop_t *loop) {
         }
 
         /* 3. Dynamic NVML Telemetry Sampling */
+        flags = 0;
         telemetry_nvml_sample(loop->nvml, &nvml_sample, &flags);
         if (is_late) {
             flags |= BLACKBOX_FLAG_TIMER_LATE;
@@ -280,7 +280,7 @@ void timer_loop_run(timer_loop_t *loop) {
             proc_rec.process.qpc_100ns = current_qpc_100ns;
             proc_rec.process.fg_pid    = (uint32_t)fg_pid;
             memcpy(proc_rec.process.name, fg_name, 32);
-            ring_buffer_writer_write_record(loop->writer, &proc_rec);
+            if (!ring_buffer_writer_write_record(loop->writer, &proc_rec)) return false;
         }
 
         /* 6. Emit Type 0 (Periodic Telemetry Data) Record */
@@ -300,7 +300,7 @@ void timer_loop_run(timer_loop_t *loop) {
         data_rec.data.seq           = loop->seq++;
         data_rec.data.tsc           = current_tsc;
         data_rec.data.qpc_100ns     = current_qpc_100ns;
-        ring_buffer_writer_write_record(loop->writer, &data_rec);
+        if (!ring_buffer_writer_write_record(loop->writer, &data_rec)) return false;
 
         /* 7. Cadence Check: Type 3 (Heartbeat) Record (every 10 seconds) */
         uint32_t uptime_sec = (uint32_t)((current_qpc_100ns - loop->calibration->qpc_start_100ns) / 10000000ULL);
@@ -315,7 +315,7 @@ void timer_loop_run(timer_loop_t *loop) {
             hb_rec.heartbeat.tsc        = current_tsc;
             hb_rec.heartbeat.qpc_100ns  = current_qpc_100ns;
             hb_rec.heartbeat.uptime_sec = uptime_sec;
-            ring_buffer_writer_write_record(loop->writer, &hb_rec);
+            if (!ring_buffer_writer_write_record(loop->writer, &hb_rec)) return false;
             loop->last_heartbeat_sec = uptime_sec;
         }
 
@@ -331,12 +331,24 @@ void timer_loop_run(timer_loop_t *loop) {
             cal_rec.cal.tsc       = cal_tsc;
             cal_rec.cal.qpc_100ns = cal_qpc;
             cal_rec.cal.filetime  = cal_ft;
-            ring_buffer_writer_write_record(loop->writer, &cal_rec);
+            if (!ring_buffer_writer_write_record(loop->writer, &cal_rec)) return false;
             loop->last_calib_sec = uptime_sec;
         }
+        LARGE_INTEGER after_work;
+        if (!QueryPerformanceCounter(&after_work)) return false;
+        uint64_t now = calibration_qpc_ticks_to_100ns((uint64_t)after_work.QuadPart,
+                                                    loop->calibration->qpc_freq);
+        next_tick += loop->nominal_interval_100ns;
+        if (next_tick <= now) {
+            next_tick += ((now - next_tick) / loop->nominal_interval_100ns + 1) *
+                         loop->nominal_interval_100ns;
+        }
+        due_time.QuadPart = -(LONGLONG)(next_tick - now);
+        if (!SetWaitableTimer(loop->h_timer, &due_time, 0, NULL, NULL, FALSE)) return false;
     }
 
     CancelWaitableTimer(loop->h_timer);
+    return true;
 }
 
 void timer_loop_cleanup(timer_loop_t *loop) {

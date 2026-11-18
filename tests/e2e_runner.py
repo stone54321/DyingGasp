@@ -380,7 +380,7 @@ class E2ERunner:
     def run_analyzer_on_file(self, ring_file: str, extra_args: Optional[List[str]] = None) -> Tuple[int, str, str]:
         """Invokes blackbox-analyze.exe directly or through Wine."""
         if not self.analyzer_bin or not os.path.exists(self.analyzer_bin):
-            return (0, "", "")
+            raise RuntimeError("Analyzer binary not found")
 
         cmd = []
         is_windows = sys.platform.startswith("win")
@@ -884,7 +884,9 @@ class E2ERunner:
     # -------------------------------------------------------------------------
     def run_analyzer_verification(self):
         if not self.analyzer_bin or not os.path.exists(self.analyzer_bin):
-            print("\n[*] Notice: No blackbox-analyze.exe provided or found. Skipping binary execution checks.")
+            if self.analyzer_bin:
+                raise RuntimeError(f"Requested analyzer not found: {self.analyzer_bin}")
+            print("\n[*] Oracle-only run: binary behavior has NOT been tested.")
             return
 
         print("\n========================================================")
@@ -904,21 +906,21 @@ class E2ERunner:
         p_wrap = os.path.join(self.tmp_dir, "target_wrap.bin")
         generate_ring_file(p_wrap, scenario="wrap", ring_kb=64)
         code, out, err = self.run_analyzer_on_file(p_wrap)
-        wrap_ok = (code == 0)
+        wrap_ok = (code == 0) and "Buffer Wrap Count" in out and "0 wrap(s)" not in out
         self.record_test("T_EXE_02", 4, "TARGET_WRAP", "blackbox-analyze.exe on wrapped ring returns 0", wrap_ok, details=f"code={code}")
 
         # Verification 3: Torn Ring -> Exit 0 & drops torn record
         p_torn = os.path.join(self.tmp_dir, "target_torn.bin")
         generate_ring_file(p_torn, scenario="torn", torn_bytes=30)
         code, out, err = self.run_analyzer_on_file(p_torn)
-        torn_ok = (code == 0)
+        torn_ok = (code == 0) and "[TORN RECORD]" in out
         self.record_test("T_EXE_03", 4, "TARGET_TORN", "blackbox-analyze.exe on torn ring returns 0 without faulting", torn_ok, details=f"code={code}")
 
         # Verification 4: No GPU Ring -> Exit 0 with Sentinels
         p_nogpu = os.path.join(self.tmp_dir, "target_nogpu.bin")
         generate_ring_file(p_nogpu, scenario="nogpu")
         code, out, err = self.run_analyzer_on_file(p_nogpu)
-        nogpu_ok = (code == 0)
+        nogpu_ok = (code == 0) and "N/A" in out
         self.record_test("T_EXE_04", 4, "TARGET_NOGPU", "blackbox-analyze.exe on sentinel/no-gpu ring returns 0", nogpu_ok, details=f"code={code}")
 
     # -------------------------------------------------------------------------
@@ -932,6 +934,7 @@ class E2ERunner:
         print("\n========================================================")
         print("                  E2E TEST RUN SUMMARY                  ")
         print("========================================================")
+        print(" Note: only T_EXE_* cases execute the analyzer; other cases test the Python oracle.")
         print(f" Total Tests Run : {total}")
         print(f" Passed          : {passed}")
         print(f" Failed          : {failed}")

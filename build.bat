@@ -13,11 +13,11 @@ set CLEAN_FIRST=0
 
 :parse_args
 if "%~1"=="" goto validate_env
-if /i "%~1"=="/debug"    set BUILD_TYPE=Debug& shift & goto parse_args
-if /i "%~1"=="/release"  set BUILD_TYPE=Release& shift & goto parse_args
-if /i "%~1"=="/clean"    set CLEAN_FIRST=1& shift & goto parse_args
-if /i "%~1"=="/msvc"     set COMPILER_CHOICE=msvc& shift & goto parse_args
-if /i "%~1"=="/mingw"    set COMPILER_CHOICE=mingw& shift & goto parse_args
+if /i "%~1"=="/debug"    (set BUILD_TYPE=Debug& shift & goto parse_args)
+if /i "%~1"=="/release"  (set BUILD_TYPE=Release& shift & goto parse_args)
+if /i "%~1"=="/clean"    (set CLEAN_FIRST=1& shift & goto parse_args)
+if /i "%~1"=="/msvc"     (set COMPILER_CHOICE=msvc& shift & goto parse_args)
+if /i "%~1"=="/mingw"    (set COMPILER_CHOICE=mingw& shift & goto parse_args)
 if /i "%~1"=="/?"        goto show_help
 if /i "%~1"=="-h"        goto show_help
 if /i "%~1"=="/help"     goto show_help
@@ -84,7 +84,7 @@ set BUILD_DIR=%SCRIPT_DIR%build-msvc
 if "%CLEAN_FIRST%"=="1" if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
-set MSVC_FLAGS=/nologo /W4 /WX /GS /GF /Gy /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I"%SCRIPT_DIR%include" /I"%SCRIPT_DIR%src"
+set MSVC_FLAGS=/nologo /std:c11 /utf-8 /W4 /WX /GS /GF /Gy /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I"%SCRIPT_DIR%include" /I"%SCRIPT_DIR%src"
 if "%BUILD_TYPE%"=="Release" (
     set MSVC_FLAGS=!MSVC_FLAGS! /O2 /MT /DNDEBUG /GL
     set MSVC_LINK_FLAGS=/INCREMENTAL:NO /OPT:REF /OPT:ICF /LTCG
@@ -121,7 +121,7 @@ if exist "%SCRIPT_DIR%src\analyzer_main.c" (
 
 if defined HAS_COLLECTOR (
     echo [*] Compiling blackbox.exe...
-    cl.exe !MSVC_FLAGS! !COLLECTOR_SRCS! /Fo"%BUILD_DIR%\\" /Fe"%SCRIPT_DIR%bin\blackbox.exe" /link !MSVC_LINK_FLAGS! kernel32.lib user32.lib advapi32.lib
+    cl.exe !MSVC_FLAGS! !COLLECTOR_SRCS! /Fo"%BUILD_DIR%\\" /Fe"%SCRIPT_DIR%bin\blackbox.exe" /link !MSVC_LINK_FLAGS! kernel32.lib user32.lib advapi32.lib shell32.lib
     if !errorlevel! neq 0 (
         echo [ERROR] MSVC build of blackbox.exe failed!
         exit /b 1
@@ -130,12 +130,15 @@ if defined HAS_COLLECTOR (
 
 if defined HAS_ANALYZER (
     echo [*] Compiling blackbox-analyze.exe...
-    cl.exe !MSVC_FLAGS! !ANALYZER_SRCS! /Fo"%BUILD_DIR%\\" /Fe"%SCRIPT_DIR%bin\blackbox-analyze.exe" /link !MSVC_LINK_FLAGS! kernel32.lib user32.lib advapi32.lib wevtapi.lib
+    cl.exe !MSVC_FLAGS! !ANALYZER_SRCS! /Fo"%BUILD_DIR%\\" /Fe"%SCRIPT_DIR%bin\blackbox-analyze.exe" /link !MSVC_LINK_FLAGS! kernel32.lib user32.lib advapi32.lib shell32.lib wevtapi.lib
     if !errorlevel! neq 0 (
         echo [ERROR] MSVC build of blackbox-analyze.exe failed!
         exit /b 1
     )
 )
+
+cl.exe !MSVC_FLAGS! "%SCRIPT_DIR%tests\test_core.c" "%SCRIPT_DIR%src\ring_buffer.c" "%SCRIPT_DIR%src\calibration.c" "%SCRIPT_DIR%src\timer_loop.c" "%SCRIPT_DIR%src\telemetry_nvml.c" "%SCRIPT_DIR%src\telemetry_process.c" /Fo"%BUILD_DIR%\\" /Fe"%SCRIPT_DIR%bin\blackbox-test-core.exe" /link !MSVC_LINK_FLAGS! kernel32.lib user32.lib advapi32.lib
+if errorlevel 1 exit /b 1
 
 if exist "%SCRIPT_DIR%tests\synthetic_gen.c" (
     echo [*] Compiling synthetic_gen.exe...
@@ -186,7 +189,7 @@ if exist "%SCRIPT_DIR%src\analyzer_main.c" (
 
 if defined HAS_COLLECTOR (
     echo [*] Compiling blackbox.exe...
-    gcc.exe !MINGW_FLAGS! !COLLECTOR_SRCS! -o "%SCRIPT_DIR%bin\blackbox.exe" -lkernel32 -luser32 -ladvapi32
+    gcc.exe !MINGW_FLAGS! !COLLECTOR_SRCS! -o "%SCRIPT_DIR%bin\blackbox.exe" -lkernel32 -luser32 -ladvapi32 -lshell32
     if !errorlevel! neq 0 (
         echo [ERROR] MinGW build of blackbox.exe failed!
         exit /b 1
@@ -195,12 +198,15 @@ if defined HAS_COLLECTOR (
 
 if defined HAS_ANALYZER (
     echo [*] Compiling blackbox-analyze.exe...
-    gcc.exe !MINGW_FLAGS! !ANALYZER_SRCS! -o "%SCRIPT_DIR%bin\blackbox-analyze.exe" -lkernel32 -luser32 -ladvapi32 -lwevtapi
+    gcc.exe !MINGW_FLAGS! !ANALYZER_SRCS! -o "%SCRIPT_DIR%bin\blackbox-analyze.exe" -lkernel32 -luser32 -ladvapi32 -lshell32 -lwevtapi
     if !errorlevel! neq 0 (
         echo [ERROR] MinGW build of blackbox-analyze.exe failed!
         exit /b 1
     )
 )
+
+gcc.exe !MINGW_FLAGS! "%SCRIPT_DIR%tests\test_core.c" "%SCRIPT_DIR%src\ring_buffer.c" "%SCRIPT_DIR%src\calibration.c" "%SCRIPT_DIR%src\timer_loop.c" "%SCRIPT_DIR%src\telemetry_nvml.c" "%SCRIPT_DIR%src\telemetry_process.c" -o "%SCRIPT_DIR%bin\blackbox-test-core.exe" -lkernel32 -luser32 -ladvapi32
+if errorlevel 1 exit /b 1
 
 if exist "%SCRIPT_DIR%tests\synthetic_gen.c" (
     echo [*] Compiling synthetic_gen.exe...

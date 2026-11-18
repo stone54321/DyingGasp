@@ -112,7 +112,7 @@ bool timer_loop_init(timer_loop_t *loop,
  *
  * @param loop Initialized timer loop instance.
  */
-void timer_loop_run(timer_loop_t *loop);
+bool timer_loop_run(timer_loop_t *loop);
 
 /**
  * @brief Clean up timer handles and resources.

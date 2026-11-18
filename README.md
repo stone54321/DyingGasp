@@ -1,12 +1,12 @@
 # Blackbox: High-Durability Pre-Crash Telemetry Ring-Logger & Crash Analyzer
 
-Blackbox is a pure C11 / Win32 user-mode telemetry ring-logger daemon (`blackbox.exe`) and post-mortem crash analyzer (`blackbox-analyze.exe`) engineered for Windows 10/11 x64. It diagnoses silent PC reboots, kernel panics, transient power cuts, GPU throttling, and PCIe degradation without requiring kernel drivers.
+Blackbox is a pure C11 / Win32 user-mode telemetry ring-logger daemon (`blackbox.exe`) and post-mortem crash analyzer (`blackbox-analyze.exe`) engineered for Windows 10/11 x64. It records CPU, foreground-process and optional NVIDIA GPU telemetry for post-crash inspection. Anomaly tags identify observations, not proven causes of a reboot or hardware failure.
 
 ---
 
 ## 1. Architectural Overview & Data Flow
 
-Blackbox is architected around the principle that kernel crashes, PSU over-current trips (OCP), and instant power cuts invalidate user-mode buffers and filesystem caches. To achieve forensic persistence, Blackbox employs write-through pre-allocated circular disk storage with zero memory allocations in the hot path.
+Blackbox is architected around the principle that kernel crashes, PSU over-current trips (OCP), and instant power cuts invalidate user-mode buffers and filesystem caches. Blackbox uses pre-allocated circular storage with FILE_FLAG_WRITE_THROUGH and no explicit dynamic allocation in its sampling loop. This reduces buffering; it does not guarantee lossless recovery from power failure or atomic 64-byte writes.
 
 ```
 +-----------------------------------------------------------------------------------------+
@@ -26,7 +26,7 @@ Blackbox is architected around the principle that kernel crashes, PSU over-curre
 |   |   - Process Tracker: PID -> QueryFullProcessImageNameW on delta (Type 1 record) |   |
 |   |   - Dynamic NVML: Temp, Power, Clocks, PCIe Gen/Width, Replay Counter           |   |
 |   |   - Hot Loop: Pure Win32, Zero malloc/HeapAlloc, Zero printf, Zero locks        |   |
-|   |   - Hot Loop CPU Usage: < 0.5% single core at 10 Hz                             |   |
+|   |   - CPU usage: hardware/driver/storage dependent                             |   |
 |   |   - SetConsoleCtrlHandler (clean_shutdown = 1 on clean exit, 0 on crash)       |   |
 |   +----------------------------------------+----------------------------------------+   |
 |                                            | SetFilePointerEx + WriteFile               |
@@ -57,34 +57,35 @@ Blackbox is architected around the principle that kernel crashes, PSU over-curre
 
 ### Core Hot-Loop Guarantees
 - **Zero Dynamic Memory Allocation**: All telemetry buffers and structs are stack-allocated; zero calls to `malloc`, `free`, `HeapAlloc`, or C++ `new` in the sampling path.
-- **Zero Console I/O & Locks**: Zero `printf`, `wprintf`, or synchronization primitives in the hot loop.
-- **CPU Footprint**: Well below 0.5% single CPU core utilization at 10 Hz.
+- **Sampling path**: No console printing or explicit heap allocation. The collector waits on a timer/stop event; a separate hidden-window thread handles session shutdown notifications.
+- **CPU Footprint**: Depends on the driver, hardware and storage latency; measure on the target machine. No universal utilization bound is guaranteed.
 
 ---
 
 ## 2. Binary Format Specification
 
 ### 2.1 File Header (4096 Bytes, Little-Endian)
-The first 4 KB (`0x0000..0x0FFF`) contains immutable metadata, geometric constants, and system clock calibrations:
+The first 4 KB (`0x0000..0x0FFF`) contains geometry, clock anchors and mutable shutdown/session metadata. The packed structures in `include/blackbox_format.h` are authoritative:
 
 | Offset | Size | Type | Field Name | Description |
 |---|---|---|---|---|
-| `0x0000` | 8 B | `u64` / `char[8]` | `magic` | ASCII `"BLKBOX01"` (`0x3130584F424B4C42`) |
-| `0x0008` | 4 B | `u32` | `version` | Header format version (`1`) |
-| `0x000C` | 4 B | `u32` | `header_size` | Header size in bytes (`4096`) |
-| `0x0010` | 8 B | `u64` | `ring_bytes` | Total pre-allocated file size (e.g. `67,108,864`) |
-| `0x0018` | 4 B | `u32` | `record_size` | Size of each telemetry record in bytes (`64`) |
-| `0x001C` | 4 B | `u32` | `nominal_hz` | Collector sampling frequency in Hz (1..100, default `10`) |
-| `0x0020` | 8 B | `u64` | `record_count` | Total physical record slots: `(ring_bytes - 4096) / 64` |
-| `0x0028` | 8 B | `u64` | `cal_tsc` | TSC counter reading (`__rdtsc()`) at calibration instant |
-| `0x0030` | 8 B | `u64` | `cal_qpc_100ns` | QPC timestamp scaled to 100ns units at calibration |
-| `0x0038` | 8 B | `u64` | `cal_filetime` | Win32 `FILETIME` UTC timestamp at calibration |
-| `0x0040` | 8 B | `u64` | `tsc_freq_hz` | Estimated hardware TSC frequency in Hertz |
-| `0x0048` | 8 B | `u64` | `start_time` | Win32 `FILETIME` timestamp when collector initialized |
-| `0x0050` | 8 B | `u64` | `reserved_cal` | Reserved for clock skew correction |
-| `0x0058` | 4 B | `u32` | `clean_shutdown` | `0` = running/crash/kill, `1` = clean shutdown |
-| `0x005C` | 4 B | `u32` | `generation` | Collector session generation counter |
-| `0x0060..0x0FFF`| 3904 B | `u8[]` | `reserved` | Zero-padded to fill exactly 4096 bytes |
+| `0x0000` | 8 B | u64 | magic | ASCII BLKBOX01 |
+| `0x0008` | 4 B | u32 | version | 1 |
+| `0x000C` | 4 B | u32 | header_size | 4096 |
+| `0x0010` | 8 B | u64 | ring_bytes | Header plus all record slots |
+| `0x0018` | 4 B | u32 | record_size | 64 |
+| `0x001C` | 4 B | u32 | record_count | `(ring_bytes - 4096) / 64` |
+| `0x0020` | 8 B | u64 | qpc_freq | QPC ticks per second |
+| `0x0028` | 8 B | u64 | qpc_start_ticks | Initial raw QPC |
+| `0x0030` | 8 B | u64 | qpc_start_100ns | Initial QPC in 100 ns units |
+| `0x0038` | 8 B | u64 | tsc_start | Initial TSC |
+| `0x0040` | 8 B | u64 | filetime_start | UTC FILETIME paired with QPC |
+| `0x0048` | 4 B | u32 | nominal_hz | 1..100 Hz |
+| `0x004C` | 4 B | u32 | daemon_pid | Current writer PID |
+| `0x0050` | 8 B | u64 | reserved_flags | Reserved |
+| `0x0058` | 4 B | u32 | clean_shutdown | In reserved_padding: 0 active/unclean, 1 clean |
+| `0x005C` | 4 B | u32 | generation | In reserved_padding: clean-resume counter |
+| `0x0060` | 4000 B | u8[] | reserved | Zero padding |
 
 ### 2.2 Record Format (64 Bytes, Little-Endian)
 Records are persisted in 64-byte slots starting at byte offset `0x00001000` (4096).
@@ -108,11 +109,10 @@ Offset  Size  Type  Field Name     Description
 0x10    4 B   u32   sm_clock_mhz   GPU Streaming Multiprocessor clock in MHz
 0x14    4 B   u32   mem_clock_mhz  GPU Memory clock in MHz
 0x18    4 B   u32   fg_pid         Foreground window process ID
-0x1C    4 B   u32   reserved0      Zero padding / alignment
-0x20    8 B   u64   seq            Monotonic sequence counter (0, 1, 2, ...)
-0x28    8 B   u64   tsc            Hardware TSC counter (__rdtsc)
-0x30    8 B   u64   qpc_100ns      High-resolution QPC time (100ns units)
-0x38   12 B   u8[]  reserved1      Reserved / zero padding (64 bytes total)
+0x1C    8 B   u64   seq            Monotonic sequence counter (0, 1, 2, ...)
+0x24    8 B   u64   tsc            Hardware TSC counter (__rdtsc)
+0x2C    8 B   u64   qpc_100ns      High-resolution QPC time (100ns units)
+0x34   12 B   u8[]  reserved1      Reserved / zero padding (64 bytes total)
 ```
 
 #### Type 1: Foreground Process Transition Record
@@ -123,10 +123,10 @@ Offset  Size  Type  Field Name     Description
 0x01    1 B   u8    flags          Status flags (bit 1: fg_query_ok)
 0x02    1 B   u8    name_len       Length of executable basename string
 0x03    1 B   u8    pad0           Zero padding
-0x04    4 B   u32   fg_pid         Foreground window process ID
-0x08    8 B   u64   seq            Monotonic sequence counter
-0x10    8 B   u64   tsc            Hardware TSC counter
-0x18    8 B   u64   qpc_100ns      High-resolution QPC time (100ns units)
+0x04    8 B   u64   seq            Monotonic sequence counter
+0x0C    8 B   u64   tsc            Hardware TSC counter
+0x14    8 B   u64   qpc_100ns      High-resolution QPC time (100ns units)
+0x1C    4 B   u32   fg_pid         Foreground window process ID
 0x20   32 B   char  name[32]       Basename of executable (NUL-terminated, up to 31 chars)
 ```
 
@@ -218,11 +218,11 @@ Artifacts are emitted directly into `bin/`:
 - `bin/blackbox-analyze.exe`
 
 ### 4.2 Windows Native Build
-Open a **Visual Studio x64 Native Tools Command Prompt** (for MSVC `cl.exe`) or a standard Command Prompt with MinGW `gcc.exe` in `PATH`:
+Open a **Visual Studio x64 Native Tools Command Prompt** (for MSVC `cl.exe` with C11 support (Visual Studio 2019 16.7 or newer)) or a standard Command Prompt with MinGW `gcc.exe` in `PATH`:
 ```cmd
 build.bat /release
 ```
-- **MSVC Flags**: `/W4 /WX /O2 /MT /GS /GF /Gy /GL` (strictly 0 warnings with `/WX`).
+- **MSVC Flags**: `/std:c11 /utf-8 /W4 /WX /O2 /MT /GS /GF /Gy /GL` (strictly 0 warnings with `/WX`).
 - **MinGW Flags**: `-std=c11 -Wall -Wextra -Wpedantic -Werror -O2 -static -static-libgcc`.
 
 ---
@@ -248,12 +248,24 @@ Run the acceptance harness directly in Windows `cmd.exe`:
 ```cmd
 run_tests_windows.bat
 ```
-This executes all 5 tests natively:
-1. `test_wrap.bat`: Capacity overflow & circular wraparound verification.
-2. `test_kill.bat`: Forced kill (`taskkill /f`) and post-restart crash recovery.
-3. `test_nogpu.bat`: Execution without NVML, confirming sentinel logging.
-4. `test_torn.bat`: 30-byte truncated record boundary validation & recovery.
-5. `test_rotate.bat`: Crash detection, atomic rotation to `ring-crash-*.bin`, and fresh `ring.bin` creation.
+This executes native regression tests followed by the legacy E2E suite. Python 3 is required.
+
+```cmd
+python tests/test_regressions.py -v
+python tests/test_adversarial.py
+```
+
+The regression suite checks actual binaries, including collector wrap, forced kill,
+byte-identical crash rotation, clean resume, session-end notifications, disk/timer
+failure propagation, no-GPU sentinels, Unicode paths and analyzer output.
+It stops only processes it starts. `build.bat` also builds `blackbox-test-core.exe`,
+which the regression suite uses for controlled I/O/timer failures and no-GPU sampling.
+The five `tests/test_*.bat` files are shortcuts to selected regression cases.
+
+The legacy **178** E2E checks contain **174 Python oracle checks and only 4 executable
+checks**. They must not be described as 178 independent checks of the C program.
+The adversarial suite runs 48 analyzer cases natively on Windows or through Wine.
+Linux shell/stress harnesses have not been revalidated by this Windows audit.
 
 ---
 
@@ -263,33 +275,44 @@ The analyzer runs automated anomaly detection rules across chronological samples
 
 | Anomaly Tag | Detection Criterion | Hardware / Diagnostic Meaning |
 |---|---|---|
-| `[HANG]` | Delta-t > 3x nominal period | Kernel freeze, high-priority DPC/ISR storm, or scheduler starvation. |
-| `[POWER SPIKE]` | \|Delta-P_GPU\| > 100 W (100,000 mW) | Transient voltage surge, VRM collapse, or PSU trip (OCP/UVP). |
-| `[PCIE DROP]` | Link Gen or Width decreased | Physical PCIe bus degradation, damaged traces, or riser cable failure. |
-| `[REPLAY JUMP]` | PCIe replay counter increased (Delta > 0) | Physical layer PCIe link packet transmission errors requiring replay. |
-| `[TORN RECORD]` | Corrupted magic/type/seq at boundary | Abrupt power interruption mid-record; boundary discarded safely. |
+| `[HANG]` | Time between data samples > 3x nominal period | Sampling delay; possible scheduling, driver or storage stall. |
+| `[POWER SPIKE]` | Absolute GPU power change > 100 W | Observed power change; normal workload transitions may also trigger it. |
+| `[PCIE DROP]` | An available link generation or width decreases | Observed link change; power management can cause normal changes. |
+| `[REPLAY JUMP]` | Available replay counter increases | Observed retransmission counter change; investigate with other evidence. |
+| `[TORN RECORD]` | Truncated file, invalid record type or slot/sequence mismatch | Structural inconsistency; v1 has no checksum and cannot detect every torn write. |
+
+Telemetry comparisons skip intervening service records. Wall times use retained
+calibration records in sequence order; the header is the fallback anchor. If a
+session's calibration has already been overwritten by the ring, historical clock
+corrections cannot always be reconstructed. Process names are also unavailable
+when the relevant transition has been overwritten. Missing data is not inferred.
 
 ---
 
-## 7. Manual Acceptance Test: Real Hardware Power-Cut
+## 7. Runtime behavior and limits
 
-To verify absolute zero-loss crash durability on physical Windows hardware:
+- Stop an interactive run with Ctrl+C or Ctrl+Break. Successful cleanup marks the
+  header clean; timer or write failures return a nonzero exit code and leave it unclean.
+- A hidden top-level window handles WM_ENDSESSION because a program loading user32
+  does not receive console logoff/shutdown events. Windows can still forcibly
+  terminate a process that cannot finish within its shutdown deadline.
+- Crash rotation uses `ring-crash-YYYYMMDD-HHMMSS-mmm-NNN.bin` and never replaces a
+  same-name file. The existing retention policy keeps up to three recent crash files.
+  A failed rename stops collection instead of overwriting the evidence.
+- An invalid existing header is preserved and rejected. A clean ring can resume
+  only with the same size and sampling rate; use a new `--path` to change them.
+- Invalid numbers, empty/overlong paths and unknown options fail explicitly.
+  If the default directory is unwritable, select a writable `--path`.
+- Running from the SYSTEM startup task does not capture another user's foreground
+  desktop. Run interactively in that user's session when foreground tracking matters.
+- The event-log report lists recent matching system events; it does **not** prove
+  their temporal or causal connection to the selected ring. The live PCIe counter
+  can reset at reboot or belong to different hardware; its delta is not a diagnosis.
+- Write-through is not unbuffered I/O, a storage-controller guarantee, or a checksum.
+  Recovery after a real power cut depends on the hardware and driver stack. A
+  forced-process-termination test does not verify power-loss durability. No physical
+  power-cut, BSOD, system reboot or service installation was performed in the audit.
 
-1. **Deploy Blackbox**: Run `install.bat` as Administrator on a physical Windows 10/11 test machine with an active workload (e.g. 3D game, GPU benchmark, or FurMark).
-2. **Verify Execution**: Ensure `blackbox.exe` is running at 10 Hz and writing to `C:\ProgramData\blackbox\ring.bin`.
-3. **Execute Power-Cut**: While telemetry is actively collecting under load, **physically pull the AC power cord** directly from the power supply unit (PSU). Do NOT use software shutdown.
-4. **Boot Target Machine**: Reconnect the power cord and boot back into Windows.
-5. **Observe Automatic Rotation**:
-   - The `BlackboxLogger` scheduled task starts `blackbox.exe` on boot.
-   - The collector detects `clean_shutdown == 0` from the power cut.
-   - The collector atomically renames `ring.bin` to `ring-crash-<YYYYMMDD-HHMMSS>.bin`.
-   - A fresh `ring.bin` is pre-allocated for the new session.
-6. **Run Analyzer**: Open Command Prompt as Administrator and run:
-   ```cmd
-   "C:\Program Files\Blackbox\blackbox-analyze.exe"
-   ```
-7. **Expected Verification Result**:
-   - The analyzer automatically discovers and selects the rotated `ring-crash-*.bin`.
-   - The pre-crash telemetry tail is displayed in tabular format up to within **one single polling period (100 ms)** of the power cord disconnection.
-   - If power was severed while writing a record slot, that partial record is cleanly identified and dropped as `[TORN RECORD]` without faulting.
-   - The live NVML PCIe replay delta and Event Log correlation (Event 41: Kernel-Power) are presented accurately.
+Win32 behavior: [file caching](https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching),
+[write-through flags](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-createfile2_extended_parameters),
+[shutdown handler requirements](https://learn.microsoft.com/en-us/windows/console/registering-a-control-handler-function).
